@@ -1,0 +1,105 @@
+CoreMark, YOpen app core, -Os -flto -mcpu=cortex-m3 -mthumb (YOpen SDK defaults)
+CPUID: 0x412fc231 (part 0xc23)
+core clock (DWT): 204 MHz
+calibrated: 355 iters/run
+run 1: 1995 ms
+run 2: 1995 ms
+run 3: 1995 ms
+run 4: 1995 ms
+run 5: 1995 ms
+run 6: 1995 ms
+CoreMark: 177.94 iter/s (2130 iters, 11970 ms)
+CoreMark/MHz: 0.87
+validation: CRCs OK (2K performance run)
+done
+
+CoreMark, YOpen app core, -O3 (pragma) -flto -mcpu=cortex-m3 -mthumb
+CPUID: 0x412fc231 (part 0xc23)
+core clock (DWT): 204 MHz
+calibrated: 761 iters/run
+run 1: 1998 ms
+run 2: 1998 ms
+run 3: 1998 ms
+run 4: 1998 ms
+run 5: 1998 ms
+run 6: 1998 ms
+CoreMark: 380.88 iter/s (4566 iters, 11988 ms)
+CoreMark/MHz: 1.86
+validation: CRCs OK (2K performance run)
+done
+
+
+
+1024,2104320,0,0,PHY_ONLINE,PHY_ULPATH_MODULE,PhySendTxPwrRpt_0,P_WARNING,swLogPrintf("highLowInd = %d reason = %d , currTxPwr = %d , lastTxExceedThr|currTxExceedThr|currTxPow|lastTxPow = 0x%X , txLoopCall|ecgiInd|txMaxInLoop|rsvd = 0x%X ");
+10240,20971520,0,0,PHY_ONLINE,PHY_RF_MODULE,RfUnitTest_1,P_SIG,swLogPrintf("data : 0x%x ");
+10240,20974080,0,0,PHY_ONLINE,PHY_RF_MODULE,RfUnitTest_wr_rd_regs,P_SIG,swLogPrintf("regAddr = 0x%x , WrVal = 0x%x , RdVal = 0x%x ");
+10240,21000448,0,0,PHY_ONLINE,PHY_RF_MODULE,RfVbatCmpstValUpd,P_SIG,swLogPrintf("Rf Vbad Update : Vbat = %d , voltgCmpVal = %d ");
+10240,21002752,0,0,PHY_ONLINE,PHY_RF_MODULE,RfAntTunerFemGpioCfg_1,P_INFO,swLogPrintf("Rf Antenna Tuner Config , bandNum = %d , gpioBitMask = 0x%x , gpioBitVal = 0x%x ");
+11264,23187455,0,0,PHY_ONLINE,PHY_SCHEDULE_MODULE,PhyCsiRsConfigUpdt_2,P_WARNING,swLogPrintf("zeroTxPowerCSI_RS2 is configured incorrectly ");
+11264,23343104,0,0,PHY_ONLINE,PHY_SCHEDULE_MODULE,PhyTxStatisInfo_1,P_SIG,swLogPrintf("PhyTxStatisInfo : txPowerInsufficientNum = %d ");
+11264,23350016,0,0,PHY_ONLINE,PHY_SCHEDULE_MODULE,CephySetTxPowerReq_1,P_WARNING,swLogPrintf("PS Request for TxPower! type : %d , targetPower = %d , maxPower = %d , minPower = %d ");
+11264,23353343,0,0,PHY_ONLINE,PHY_SCHEDULE_MODULE,PhyMibStart_1,P_WARNING,swLogPrintf("SCMIB and Idle Paging arranged in the same subframe ");
+11264,23355391,0,0,PHY_ONLINE,PHY_SCHEDULE_MODULE,PhyMibStart_2,P_WARNING,swLogPrintf("SCMIB and Idle Paging arranged in two consecutive subframes ");
+
+Yes, that's it — this confirms everything we inferred and closes the loop on the AP side.
+
+What it confirms
+bVar2 == 2 is the "set" form (AT+ECRFTEST="..."). Other forms (test =?, read ?) fall into the else branch and just reply OK/error without touching RfAtTestCmd — matching the empty +ECRFTEST / OK you got earlier.
+Hex decode confirmed: atGetStrValue pulls the quoted string, then cmsHexStrToHex(pOutput, Size, pOutStr, Size) converts ASCII hex → raw bytes. Size = uStack_1c >> 0x10 is the decoded byte length (half the hex-char count).
+No range/length validation on Size or on the command byte before calling RfAtTestCmd. Whatever hex you send, if it decodes, gets forwarded as-is. This matches RfAtTestCmd's own lack of checks for the <0x30 branch — the only gate is PhyCmiRequest's check (param_3 != 0, valid prim range), which is a minimum-length-1 check, not a format check.
+Call: RfAtTestCmd(srcHandler, pOutput, decodedLen). So the full decoded byte array is passed, length included this time — confirms RfAtTestCmd's real signature takes (handle, data, length), and for cases <0x30, length isn't even used before forwarding to PhyCmiRequest, which just needs param_3 = length (used earlier as decodedLen presumably, though the decompile of RfAtTestCmd shows it hardcoding 3 — that's the prim ID, not the length; the length must be passed via a register the decompiler didn't recover as a named param. Worth re-checking RfAtTestCmd's disassembly for a 4th arg in r3).
+What this does not give you
+
+The byte-by-byte meaning of pOutput[1], pOutput[2], etc. for indexes 0x01–0x09. That parsing is 100% on the CP side — nothing in the AP path touches those bytes beyond hex-decoding them. This function is the last AP-side link; from here it's A2CSendIpcMsg(0x300b, ...) straight into CP firmware, same as before.
+
+
+
+Confirmed safe and understood
+Command	Effect	Source
+AT+ECRFTEST="31"	Prints +rc32k:<24 hex> once, then again after 10s. Reads the 32kHz clock calibration counters. No RF, no flash write.	Decompiled RfRc32KTestTmExp, tested by you, worked as predicted
+AT+ECRFTEST="30"	Same clock read, but repeats every 1s forever (until reboot), and reconfigures pad 0x10 / GPIO 0 as an output first	Decompiled, not tested
+AT+ECRFTEST=? / AT+ECRFTEST?	Just returns +ECRFTEST / OK, no info leaked	Tested by you
+Confirmed structure, but not safe to use yet
+Command	What we know	What's missing
+AT+ECRFTEST="50"	Disables IRQs, stops watchdog, loops ~13 min reading RC32K, no timeout override	Known behavior, just very disruptive — not dangerous to RF, just freezes the module for a long time
+AT+ECRFTEST="60xx"	Writes register 0x4f02008c, using low 4 bits of byte 2 (param_2[1] & 0xF)	Know the exact bit operation, don't know what that register controls (LDORET name suggests low-power retention voltage)
+AT+ECRFTEST="00..." (RF_UNIT_TEST)	Register read/write test per log strings (regAddr, WrVal, RdVal)	Byte layout of address/value fields not confirmed from code, only inferred from log format string
+AT+ECRFTEST="01..." through "09..."	Confirmed: gets hex-decoded, forwarded verbatim to the CP core via PhyCmiRequest→A2CSendIpcMsg(0x300b,...). AP does zero validation.	Zero knowledge of parameter bytes. This is TX power, APT DAC, TX cmd, thermal, temp comp, signaling debug, voltage comp, PA bias, FEM GPIO — exactly the ones you called "the juicy ones"
+The mechanism, fully confirmed end-to-end
+
+AT+ECRFTEST="<hex>" → pdECRFTEST (AP) hex-decodes the string, no length/range check → RfAtTestCmd → byte 0 < 0x30 → PhyCmiRequest(handle, primId=3) → A2CSendIpcMsg(0x300b, len, buf) → CP core, unknown handler.
+
+
+Dispatcher location (this file, final flashing version)
+Function entry: 0x10b20
+Reads dataIn[0] into r4 via ldrb r4, [r1] at 0x10b30
+Range check cmp r4, #0x11 / bhi at 0x10b4c
+tbh [pc, r4, lsl #1] at 0x10b52
+Table base: 0x10b56
+Decoded jump table — resolved targets
+idx	ECRFTEST name	target	status
+0x00	RF_UNIT_TEST	0x10b7a	real
+0x01	TX_POWER_FIXED	0x111e4	no-op
+0x02	APT_DAC_FIXED	0x11086	real
+0x03	TX_CMD_FIXED	0x110ce	real
+0x04	THERMAL_VAL_GET	0x111e4	no-op
+0x05	TMPRT_COMP_ONOFF	0x11154	real
+0x06	SIGNALING_DEBUG_ENA	0x11146	real
+0x07	VOLTG_COMP_ONOFF	0x11194	real
+0x08	TX_PABIAS_MIPI_REGS_FIXED	0x111e4	no-op
+0x09	FEM_GPIO_SET	0x111b0	real
+0x0a–0x0f	unused	0x111e4	no-op
+0x10	undocumented	0x111be	real
+0x11	undocumented	0x111da	real
+
+
+Several ECRFTEST indices are handled entirely on the AP side, never reaching the CP dispatcher at all:
+
+index	header name	what actually happens
+0x30	RF_RC32K_LATCH_URC	Configures a GPIO pin, starts a periodic 1000-unit OS timer. Local only.
+0x31	RF_RC32K_GAP_GET	Calls RfRc32KTestTmExp directly, starts a one-shot timer. Local only.
+0x50	RF_RC32K_PTEST	See below — this is the one to be careful with.
+0x60	RF_LDORET_SET	Directly RMWs a hardware register (DAT_00968194 + 0x8c), bits [12:9] set from param_2[1] & 0xf, ORs in 0x180c0. Immediate, local, no CP round-trip.
+0x70	RF_DCDCVPA_ENA_DEBUG	Not handled by this function at all — falls through and returns with no action.
+
+AT+ECRFTEST → pdECRFTEST → RfAtTestCmd → PhyCmiRequest(atHandle, primId=3) → CP dispatcher @0x810F1A → jump table[dataIn[0]] → 0x81168E (no-op) for indices 0x01/0x04/0x08
